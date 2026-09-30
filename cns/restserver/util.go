@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"strconv"
 	"strings"
@@ -147,6 +148,51 @@ func (service *HTTPRestService) saveNetworkContainerGoalStateWithVersionValidati
 	service.Lock()
 	defer service.Unlock()
 
+	returnCode, returnMessage := service.saveNetworkContainerGoalStateUntransacted(req, validateVersion, true)
+	if returnCode != types.Success {
+		return returnCode, returnMessage
+	}
+	_ = service.saveState()
+	return 0, ""
+}
+
+// saveNetworkContainerGoalStates saves every NC goal of one NNC under one lock and persists the state once.
+// It checks IP uniqueness for the whole goal, so the order of the NCs does not matter.
+// If any NC goal fails, it restores the previous NC and IP pool state.
+func (service *HTTPRestService) saveNetworkContainerGoalStates(goals []NetworkContainerGoal) (code types.ResponseCode, message string) {
+	if len(goals) == 0 {
+		return types.Success, ""
+	}
+	service.Lock()
+	defer service.Unlock()
+
+	if service.state.OrchestratorType == cns.KubernetesCRD {
+		existing := make(map[string]cns.SecondaryIPConfig)
+		incoming := make(map[string]cns.SecondaryIPConfig)
+		for i := range goals {
+			maps.Copy(existing, service.state.ContainerStatus[goals[i].Request.NetworkContainerid].CreateNetworkContainerRequest.SecondaryIPConfigs)
+			maps.Copy(incoming, goals[i].Request.SecondaryIPConfigs)
+		}
+		if code, message = validateUniqueSecondaryIPs(service.PodIPConfigState, existing, incoming); code != types.Success {
+			return code, message
+		}
+	}
+
+	containerStatus := maps.Clone(service.state.ContainerStatus)
+	podIPConfigState := maps.Clone(service.PodIPConfigState)
+	for i := range goals {
+		if code, message = service.saveNetworkContainerGoalStateUntransacted(*goals[i].Request, goals[i].ValidateVersion, false); code != types.Success {
+			service.state.ContainerStatus = containerStatus
+			service.PodIPConfigState = podIPConfigState
+			return code, message
+		}
+	}
+	_ = service.saveState()
+	return types.Success, ""
+}
+
+// saveNetworkContainerGoalStateUntransacted saves one NC goal. The caller holds the service lock and persists the state.
+func (service *HTTPRestService) saveNetworkContainerGoalStateUntransacted(req cns.CreateNetworkContainerRequest, validateVersion, validateUniqueIPs bool) (types.ResponseCode, string) { //nolint // legacy
 	var (
 		hostVersion                string
 		existingSecondaryIPConfigs map[string]cns.SecondaryIPConfig // uuid is key
@@ -174,7 +220,7 @@ func (service *HTTPRestService) saveNetworkContainerGoalStateWithVersionValidati
 		}
 	}
 
-	if service.state.OrchestratorType == cns.KubernetesCRD {
+	if validateUniqueIPs && service.state.OrchestratorType == cns.KubernetesCRD {
 		if returnCode, message := validateUniqueSecondaryIPs(service.PodIPConfigState, existingSecondaryIPConfigs, req.SecondaryIPConfigs); returnCode != types.Success {
 			return returnCode, message
 		}
@@ -266,7 +312,6 @@ func (service *HTTPRestService) saveNetworkContainerGoalStateWithVersionValidati
 		return types.UnsupportedNetworkContainerType, errMsg
 	}
 
-	service.saveState()
 	return 0, ""
 }
 
